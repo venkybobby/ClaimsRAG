@@ -17,12 +17,18 @@ Design choices (see README.md for the full rationale):
   - Refusal is a similarity gate: if the best chunk match is below
     REFUSAL_THRESHOLD, the pipeline says it cannot answer instead of
     returning a low-confidence guess.
+
+The chunking + embedding step itself lives in pdf_vector_indexer.py as a
+standalone, reusable PDFVectorIndexer class (any PDF folder in, chunks +
+embeddings out) -- this module just wires it up with this project's
+specific paths/model/sizing and adds the retrieval/answer side on top.
 """
 import json
-import re
 from pathlib import Path
 
 import numpy as np
+
+from pdf_vector_indexer import PDFVectorIndexer
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE_PDF_DIR = ROOT / "data" / "source_pdfs"
@@ -47,180 +53,33 @@ CHUNK_OVERLAP_WORDS = 40
 REFUSAL_THRESHOLD = 0.6
 TOP_K = 4
 
-HEADER_LINE_RE = re.compile(
-    r"^(?P<doc_type>NCD|CFR) (?P<display_id>\S+) \(Doc ID (?P<doc_id>\S+)\) -- "
-    r"Effective (?P<date>\S+)$"
-)
-HEADING_RE = re.compile(
-    r"^([A-Z]\.\s+[A-Z][A-Za-z /()\-]+|Item/Service Description|"
-    r"Indications and Limitations of Coverage|"
-    r"\([a-z]\)\s+[A-Z][A-Za-z0-9 /()\-,:]+[.:])$"
-)
-
-
-def extract_pages(pdf_path: Path):
-    """Return [(page_num, text_without_running_header), ...] for a PDF."""
-    from pypdf import PdfReader
-
-    reader = PdfReader(str(pdf_path))
-    pages = []
-    for i, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        lines = text.split("\n")
-        if lines and HEADER_LINE_RE.match(lines[0].strip()):
-            lines = lines[1:]
-        pages.append((i, "\n".join(lines)))
-    return pages
-
-
-def parse_doc_metadata(pdf_path: Path, pages):
-    """Pull doc_id/display_id/effective_date from the running header and the
-    title from the first content lines of page 1 (both were written by
-    prepare_source_corpus.py in a known, fixed layout)."""
-    reader_text = None
-    from pypdf import PdfReader
-
-    reader = PdfReader(str(pdf_path))
-    page1_raw = reader.pages[0].extract_text() or ""
-    lines = [l for l in page1_raw.split("\n") if l.strip()]
-    m = HEADER_LINE_RE.match(lines[0].strip()) if lines else None
-    if not m:
-        raise ValueError(f"{pdf_path.name}: could not parse header line {lines[:1]!r}")
-    title = lines[2].strip() if len(lines) > 2 else pdf_path.stem
-    return {
-        "doc_type": m.group("doc_type"),
-        "doc_id": m.group("doc_id"),
-        "display_id": m.group("display_id"),
-        "effective_date": m.group("date"),
-        "title": title,
-        "source_file": pdf_path.name,
-    }
-
-
-def build_page_stream(pages):
-    """Concatenate page texts; return (full_text, [(start,end,page_num), ...])."""
-    stream = ""
-    offsets = []
-    for page_num, text in pages:
-        start = len(stream)
-        stream += text + "\n"
-        offsets.append((start, len(stream), page_num))
-    return stream, offsets
-
-
-def page_for_offset(offsets, char_idx):
-    for start, end, page_num in offsets:
-        if start <= char_idx < end:
-            return page_num
-    return offsets[-1][2] if offsets else 1
-
-
-def split_into_sections(stream: str):
-    """Split on known heading lines. Returns [(heading, char_offset, text), ...]."""
-    lines = stream.split("\n")
-    sections = []
-    cur_heading = "Preamble"
-    cur_lines = []
-    char_pos = 0
-    section_start = 0
-    for line in lines:
-        stripped = line.strip()
-        if stripped and HEADING_RE.match(stripped):
-            if cur_lines:
-                sections.append((cur_heading, section_start, "\n".join(cur_lines)))
-            cur_heading = stripped
-            cur_lines = []
-            section_start = char_pos
-        else:
-            cur_lines.append(line)
-        char_pos += len(line) + 1
-    if cur_lines:
-        sections.append((cur_heading, section_start, "\n".join(cur_lines)))
-    return sections
-
-
-def chunk_section_text(text: str):
-    """Split section text into overlapping word-windows.
-    Returns [(chunk_text, start_char_within_section), ...]."""
-    words = [(m.group(0), m.start()) for m in re.finditer(r"\S+", text)]
-    if not words:
-        return []
-    chunks = []
-    i = 0
-    while i < len(words):
-        window = words[i : i + CHUNK_WORDS]
-        start_char = window[0][1]
-        end_char = window[-1][1] + len(window[-1][0])
-        chunks.append((text[start_char:end_char].strip(), start_char))
-        if i + CHUNK_WORDS >= len(words):
-            break
-        i += CHUNK_WORDS - CHUNK_OVERLAP_WORDS
-    return chunks
-
-
-def chunk_pdf(pdf_path: Path):
-    pages = extract_pages(pdf_path)
-    doc_meta = parse_doc_metadata(pdf_path, pages)
-    stream, offsets = build_page_stream(pages)
-    sections = split_into_sections(stream)
-
-    chunks = []
-    for heading, section_start, section_text in sections:
-        if not section_text.strip():
-            continue
-        for chunk_text, local_offset in chunk_section_text(section_text):
-            if not chunk_text.strip():
-                continue
-            abs_offset = section_start + local_offset
-            page_num = page_for_offset(offsets, abs_offset)
-            chunks.append(
-                {
-                    "doc_type": doc_meta["doc_type"],
-                    "doc_id": doc_meta["doc_id"],
-                    "display_id": doc_meta["display_id"],
-                    "title": doc_meta["title"],
-                    "effective_date": doc_meta["effective_date"],
-                    "source_file": doc_meta["source_file"],
-                    "section": heading,
-                    "page": page_num,
-                    "text": chunk_text,
-                }
-            )
-    return chunks
-
-
-def build_all_chunks():
-    all_chunks = []
-    for pdf_path in sorted(SOURCE_PDF_DIR.glob("*.pdf")):
-        doc_chunks = chunk_pdf(pdf_path)
-        for i, c in enumerate(doc_chunks):
-            c["chunk_id"] = f"{c['doc_id']}-{i}"
-        all_chunks.extend(doc_chunks)
-    return all_chunks
-
 
 def get_embedder():
+    """Load the embedding model used on the retrieval/query side. Kept as a
+    standalone function (rather than only living on PDFVectorIndexer) since
+    callers here embed a single question, not a batch of chunks."""
     from sentence_transformers import SentenceTransformer
 
     return SentenceTransformer(EMBED_MODEL_NAME)
 
 
+def get_indexer() -> PDFVectorIndexer:
+    """This project's PDFVectorIndexer, pre-configured with its paths,
+    model, and chunk sizing. See pdf_vector_indexer.py for the reusable
+    class itself -- point a PDFVectorIndexer at a different pdf_dir to run
+    the same pipeline over an unrelated PDF corpus."""
+    return PDFVectorIndexer(
+        pdf_dir=SOURCE_PDF_DIR,
+        embed_model_name=EMBED_MODEL_NAME,
+        chunk_words=CHUNK_WORDS,
+        chunk_overlap_words=CHUNK_OVERLAP_WORDS,
+    )
+
+
 def build_index():
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    chunks = build_all_chunks()
-    if not chunks:
-        raise SystemExit(f"No chunks produced -- check {SOURCE_PDF_DIR} has PDFs.")
-
-    model = get_embedder()
-    texts = [c["text"] for c in chunks]
-    embeddings = model.encode(texts, normalize_embeddings=True, show_progress_bar=True)
-    embeddings = np.asarray(embeddings, dtype=np.float32)
-
-    np.save(EMBEDDINGS_PATH, embeddings)
-    with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
-        for c in chunks:
-            f.write(json.dumps(c, ensure_ascii=False) + "\n")
-
+    indexer = get_indexer()
+    chunks, embeddings = indexer.build()
+    indexer.save(chunks, embeddings, INDEX_DIR)
     return chunks, embeddings
 
 

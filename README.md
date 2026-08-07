@@ -57,7 +57,7 @@ a document title.
 data/source_pdfs/*.pdf
       |  pypdf: per-page text extraction, running header stripped
       v
-  section-aware chunking (rag_lib.chunk_pdf)
+  section-aware chunking (PDFVectorIndexer.chunk_pdf, in pdf_vector_indexer.py)
       |  never splits across a heading boundary; long sections further
       |  split into 160-word windows with 40-word overlap
       v
@@ -72,6 +72,39 @@ data/source_pdfs/*.pdf
       - below REFUSAL_THRESHOLD (0.6) -> refuse
       - otherwise -> quote the top chunk verbatim + citation
 ```
+
+### The chunk+embed step as a reusable, standalone module
+
+`src/pdf_vector_indexer.py` holds the chunking + embedding half of the
+pipeline (everything above the retrieval arrow) as a `PDFVectorIndexer`
+class with no dependency on this project's directory layout or corpus.
+`rag_lib.py` just wires it up with this project's specific paths/model/
+sizing (`get_indexer()`); a different project can import the class
+directly and point it at its own PDFs:
+
+```python
+from pdf_vector_indexer import PDFVectorIndexer
+
+indexer = PDFVectorIndexer(pdf_dir="path/to/pdfs")   # any folder of PDFs
+chunks, embeddings = indexer.build()
+indexer.save(chunks, embeddings, output_dir="path/to/index")
+```
+
+or from the command line:
+
+```bash
+python src/pdf_vector_indexer.py --pdf-dir path/to/pdfs --output-dir path/to/index \
+  --embed-model sentence-transformers/all-MiniLM-L6-v2 \
+  --chunk-words 160 --chunk-overlap-words 40
+```
+
+The default heading/header regexes are tuned for this project's NCD/CFR
+corpus (see the module docstring), but a PDF that doesn't match them still
+chunks fine — it just falls back to the filename for `doc_id`/`display_id`
+and a single "Preamble" section instead of losing the whole document.
+Verified this refactor changed nothing behaviorally: `PDFVectorIndexer`
+run standalone against `data/source_pdfs/` produces byte-identical
+`chunks.jsonl`/`embeddings.npy` to what `rag_lib.build_index()` writes.
 
 ### Why extractive, not generative
 
