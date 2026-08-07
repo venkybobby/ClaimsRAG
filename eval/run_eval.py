@@ -11,6 +11,7 @@ local index" is a real automated check, not a manually re-typed curl command.
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -22,12 +23,34 @@ from rag_lib import answer, get_embedder, load_index  # noqa: E402
 
 CASES_PATH = Path(__file__).resolve().parent / "cases.json"
 
+# Fly.io scale-to-zero: the deploy step's own health check can leave the
+# machine idle long enough to stop again before this step's first request
+# arrives, so the *first* request after a deploy can be a full cold start
+# (image already warm, but firecracker boot + model load) -- seen taking
+# >30s in practice. Wait for /health explicitly instead of hoping a single
+# request's timeout covers it.
+WAIT_FOR_READY_SECS = 90
+
+
+def wait_for_ready(base_url: str, timeout: int = WAIT_FOR_READY_SECS) -> None:
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            resp = requests.get(f"{base_url}/health", timeout=10)
+            if resp.ok and resp.json().get("status") == "ok":
+                return
+        except requests.RequestException as e:
+            last_err = e
+        time.sleep(3)
+    raise SystemExit(f"{base_url} did not become ready within {timeout}s (last error: {last_err})")
+
 
 def remote_answer(base_url: str, question: str) -> dict:
     """Call the deployed /api/ask endpoint and reshape its response into the
     same {refused, answer, results: [(chunk_dict, score), ...]} shape that
     the local rag_lib.answer() returns, so check_case() works unmodified."""
-    resp = requests.post(f"{base_url}/api/ask", json={"question": question}, timeout=30)
+    resp = requests.post(f"{base_url}/api/ask", json={"question": question}, timeout=60)
     resp.raise_for_status()
     data = resp.json()
     results = [(c, c["similarity"]) for c in data["citations"]]
@@ -82,7 +105,10 @@ def main():
     if args.remote:
         base_url = args.remote.rstrip("/")
         run_one = lambda q: remote_answer(base_url, q)  # noqa: E731
-        print(f"Running against remote: {base_url}\n")
+        print(f"Running against remote: {base_url}")
+        print(f"Waiting for /health (up to {WAIT_FOR_READY_SECS}s -- Fly scale-to-zero cold start)...")
+        wait_for_ready(base_url)
+        print("Ready.\n")
     else:
         chunks, embeddings = load_index()
         model = get_embedder()
