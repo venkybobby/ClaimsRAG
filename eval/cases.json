@@ -1,0 +1,26 @@
+[
+  {
+    "id": "answerable-colonoscopy",
+    "question": "Is a screening colonoscopy covered for a 55 year old at average risk for colorectal cancer?",
+    "type": "answerable",
+    "expect_refusal": false,
+    "must_cite_display_id": "210.3",
+    "must_contain_any": ["colonoscopy", "colorectal"]
+  },
+  {
+    "id": "refusal-knee-replacement",
+    "question": "Is a total knee replacement covered for a 70 year old with severe osteoarthritis?",
+    "type": "refusal",
+    "expect_refusal": true,
+    "note": "None of the 4 ingested NCDs (colorectal screening, PET oncology, CPAP/OSA, cardiac rehab) address joint replacement. The system must decline rather than guess or borrow language from an unrelated policy."
+  },
+  {
+    "id": "adversarial-cardiac-rehab-ef-above-threshold",
+    "question": "Is cardiac rehab covered for a patient with heart failure and a left ventricular ejection fraction of 40 percent?",
+    "type": "adversarial",
+    "expect_refusal": false,
+    "must_cite_display_id": "20.10.1",
+    "must_contain_any": ["35%"],
+    "note": "The retriever will find the *covered* heart-failure indication chunk (it's the closest topical match), but that chunk's actual criterion is LVEF <= 35%, i.e. this patient (40%) is NOT covered. The system must not refuse (real evidence exists) and must not silently claim 'covered' -- it must quote the 35% threshold verbatim so a human reviewer can see the patient doesn't meet it. Success = citation is present AND the quoted text contains the disqualifying number, not a bare 'yes'."
+  }
+]
