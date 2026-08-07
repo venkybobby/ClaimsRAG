@@ -1,9 +1,11 @@
 """FastAPI service exposing the CMS coverage RAG pipeline + a static chat UI.
 
-Loads the pre-built local index (index/chunks.jsonl + index/embeddings.npy,
-baked into the Docker image) once at startup, then answers questions using
-the same extractive/refusal logic as src/ask.py -- no external DB call, no
-API key, self-contained.
+Retrieval is Supabase-backed (supabase_client.supabase_retrieve): the
+question is embedded locally at request time, then matched against the
+live ncd_chunks table in Supabase over PostgREST. No local index is baked
+into the Docker image -- new documents pushed to Supabase by the indexing
+CI workflow (pdf_vector_indexer.py --supabase-url ...) show up here
+immediately, without a redeploy.
 """
 import sys
 import time
@@ -19,7 +21,8 @@ from pydantic import BaseModel
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from rag_lib import answer, get_embedder, load_index, REFUSAL_THRESHOLD  # noqa: E402
+from rag_lib import compose_answer, get_embedder, REFUSAL_THRESHOLD  # noqa: E402
+from supabase_client import supabase_retrieve, supabase_health  # noqa: E402
 
 _state = {}
 
@@ -27,10 +30,9 @@ _state = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     t0 = time.time()
-    _state["chunks"], _state["embeddings"] = load_index()
     _state["model"] = get_embedder()
     _state["ready_secs"] = round(time.time() - t0, 1)
-    print(f"Loaded {len(_state['chunks'])} chunks + embedder in {_state['ready_secs']}s")
+    print(f"Loaded embedder in {_state['ready_secs']}s")
     yield
 
 
@@ -65,9 +67,16 @@ class AskResponse(BaseModel):
 
 @app.get("/health")
 def health():
+    if "model" not in _state:
+        return {"status": "loading"}
+    try:
+        sb = supabase_health()
+    except Exception as e:
+        return {"status": "error", "detail": f"Supabase unreachable: {e}"}
     return {
-        "status": "ok" if "chunks" in _state else "loading",
-        "chunks_indexed": len(_state.get("chunks", [])),
+        "status": "ok",
+        "backend": "supabase",
+        "chunks_indexed": sb["chunks_indexed"],
         "refusal_threshold": REFUSAL_THRESHOLD,
     }
 
@@ -78,7 +87,8 @@ def ask(req: AskRequest):
     if not question:
         return AskResponse(question="", answer="Please enter a question.", refused=True, citations=[])
 
-    result = answer(question, _state["chunks"], _state["embeddings"], model=_state["model"])
+    results = supabase_retrieve(question, _state["model"])
+    result = compose_answer(results, threshold=REFUSAL_THRESHOLD)
     citations = [
         Citation(
             doc_type=chunk.get("doc_type", "NCD"),

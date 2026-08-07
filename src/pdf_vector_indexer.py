@@ -25,17 +25,23 @@ Usage as a library:
     from pdf_vector_indexer import PDFVectorIndexer
     indexer = PDFVectorIndexer(pdf_dir="path/to/pdfs")
     chunks, embeddings = indexer.build()
-    indexer.save(chunks, embeddings, output_dir="path/to/index")
+    indexer.save(chunks, embeddings, output_dir="path/to/index")            # local files
+    indexer.save_to_supabase(chunks, embeddings, url, service_role_key)     # and/or a live table
 
 Usage as a CLI:
     python src/pdf_vector_indexer.py --pdf-dir data/source_pdfs --output-dir index
+    python src/pdf_vector_indexer.py --pdf-dir data/source_pdfs \\
+        --supabase-url $SUPABASE_URL --supabase-key $SUPABASE_SERVICE_ROLE_KEY
 """
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
 import numpy as np
+
+SUPABASE_UPSERT_BATCH_SIZE = 25
 
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_CHUNK_WORDS = 160
@@ -280,15 +286,103 @@ class PDFVectorIndexer:
         chunks = [json.loads(l) for l in open(chunks_path, encoding="utf-8")]
         return chunks, embeddings
 
+    @staticmethod
+    def save_to_supabase(
+        chunks: list,
+        embeddings: np.ndarray,
+        supabase_url: str,
+        supabase_key: str,
+        table: str = "ncd_chunks",
+        batch_size: int = SUPABASE_UPSERT_BATCH_SIZE,
+    ) -> None:
+        """Push (chunks, embeddings) into a Supabase/Postgres table with a
+        pgvector `embedding` column, over PostgREST. Requires a table with a
+        `chunk_id text unique` column and a matching-dimension `embedding
+        vector(N)` column -- see README.md for the DDL.
+
+        `supabase_key` must be a **service-role** key: the anon key used
+        elsewhere in this project (supabase_client.py) is intentionally
+        read-only via RLS, and writes need to bypass that. Never use the
+        anon key here, and never let this key reach client-facing code.
+
+        Idempotent per document, not just per chunk: re-running this after a
+        PDF's content changed deletes all existing rows for that doc_id
+        first, then inserts the fresh set. A plain upsert-by-chunk_id alone
+        would leave orphaned rows behind if a revised document produces
+        fewer chunks than before (e.g. doc_id-14 existed in the old version,
+        doesn't exist in the new one, and nothing would ever delete it).
+        """
+        import requests
+
+        base = supabase_url.rstrip("/")
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json",
+        }
+
+        doc_ids = sorted({c["doc_id"] for c in chunks})
+        for doc_id in doc_ids:
+            resp = requests.delete(
+                f"{base}/rest/v1/{table}",
+                headers=headers,
+                params={"doc_id": f"eq.{doc_id}"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+
+        insert_url = f"{base}/rest/v1/{table}"
+        for start in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[start : start + batch_size]
+            batch_embeddings = embeddings[start : start + batch_size]
+            rows = [
+                {
+                    "chunk_id": c["chunk_id"],
+                    "doc_type": c.get("doc_type", "NCD"),
+                    "doc_id": c["doc_id"],
+                    "display_id": c["display_id"],
+                    "title": c["title"],
+                    "section": c["section"],
+                    "page": c["page"],
+                    "effective_date": c.get("effective_date", ""),
+                    "source_file": c.get("source_file", ""),
+                    "text": c["text"],
+                    "embedding": e.tolist(),
+                }
+                for c, e in zip(batch_chunks, batch_embeddings)
+            ]
+            resp = requests.post(insert_url, headers=headers, json=rows, timeout=60)
+            resp.raise_for_status()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pdf-dir", required=True, help="Folder of PDFs to chunk + embed")
-    parser.add_argument("--output-dir", required=True, help="Folder to write chunks.jsonl + embeddings.npy")
+    parser.add_argument("--output-dir", help="Folder to write chunks.jsonl + embeddings.npy")
+    parser.add_argument(
+        "--supabase-url",
+        default=os.environ.get("SUPABASE_URL"),
+        help="Push into this Supabase project instead of/in addition to --output-dir "
+        "(default: $SUPABASE_URL)",
+    )
+    parser.add_argument(
+        "--supabase-key",
+        default=os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
+        help="Service-role key -- must have write access, the anon key won't work "
+        "(default: $SUPABASE_SERVICE_ROLE_KEY)",
+    )
+    parser.add_argument("--supabase-table", default="ncd_chunks")
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
     parser.add_argument("--chunk-words", type=int, default=DEFAULT_CHUNK_WORDS)
     parser.add_argument("--chunk-overlap-words", type=int, default=DEFAULT_CHUNK_OVERLAP_WORDS)
     args = parser.parse_args()
+
+    push_to_supabase = bool(args.supabase_url and args.supabase_key)
+    if not args.output_dir and not push_to_supabase:
+        parser.error(
+            "Need a save target: --output-dir, and/or --supabase-url + --supabase-key "
+            "(or $SUPABASE_URL + $SUPABASE_SERVICE_ROLE_KEY)."
+        )
 
     indexer = PDFVectorIndexer(
         pdf_dir=args.pdf_dir,
@@ -297,12 +391,20 @@ def main():
         chunk_overlap_words=args.chunk_overlap_words,
     )
     chunks, embeddings = indexer.build()
-    indexer.save(chunks, embeddings, args.output_dir)
+
+    if args.output_dir:
+        indexer.save(chunks, embeddings, args.output_dir)
+        print(f"Wrote {args.output_dir}/chunks.jsonl + embeddings.npy")
+
+    if push_to_supabase:
+        indexer.save_to_supabase(
+            chunks, embeddings, args.supabase_url, args.supabase_key, table=args.supabase_table
+        )
+        print(f"Upserted {len(chunks)} chunks into Supabase table '{args.supabase_table}'")
 
     docs = sorted({c["display_id"] for c in chunks})
     print(f"Indexed {len(chunks)} chunks from {len(docs)} documents: {', '.join(docs)}")
     print(f"Embedding matrix shape: {embeddings.shape}")
-    print(f"Wrote {args.output_dir}/chunks.jsonl + embeddings.npy")
 
 
 if __name__ == "__main__":

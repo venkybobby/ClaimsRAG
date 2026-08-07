@@ -14,7 +14,9 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 COPY src/ src/
 COPY api/ api/
-COPY index/ index/
+# No index/ -- retrieval is Supabase-backed at request time (supabase_client.py),
+# not a local index baked into the image. See src/pdf_vector_indexer.py for the
+# indexing side that writes to Supabase.
 
 EXPOSE 8080
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]

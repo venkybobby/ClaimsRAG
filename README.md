@@ -1,10 +1,41 @@
 # CMS Coverage RAG — "Can this claim's procedure be covered?"
 
-A small, fully-local RAG pipeline over 5 real CMS/federal coverage documents,
-answering coverage questions with a citation to the exact source chunk, and
-refusing when the ingested documents don't address the question.
+A RAG pipeline over 5 real CMS/federal coverage documents, answering
+coverage questions with a citation to the exact source chunk, and refusing
+when the ingested documents don't address the question. Embedding runs
+locally (no API key); the vector store is Supabase (pgvector), fed by an
+indexing pipeline that's independent of the API/UI deploy.
 
 **Live chat UI: https://claimsrag-chat.fly.dev**
+
+## Architecture: 3 modules, 2 deployables
+
+```
+ Module 1: indexing              Module 2: search API       Module 3: chat UI
+ (pdf_vector_indexer.py)         (api/main.py)               (api/static/index.html)
+ ------------------------        ---------------------       -----------------------
+ data/source_pdfs/*.pdf                                       served by the same
+       |                                                       FastAPI app as
+       v                          embeds question               module 2 -- one
+ chunk + embed                    locally, calls                Fly app, no
+       |                          match_ncd_chunks    <----     separate deploy,
+       v                          over PostgREST                no CORS story
+ Supabase ncd_chunks   <-------                                 beyond what's
+ (pgvector)                                                     already there
+       ^
+       |
+ .github/workflows/index-corpus.yml
+ triggers on data/source_pdfs/** changes,
+ independent of the API/UI deploy workflow
+```
+
+Modules 1 and 2+3 are **independently deployable** on purpose: pushing a new
+PDF reindexes Supabase without touching the running API, and shipping an
+API/UI code change doesn't reindex anything. They share one contract — the
+`ncd_chunks` table schema — which is the thing to keep in sync if either
+side changes what it reads or writes. Modules 2 and 3 stay bundled into a
+single Fly app (one deploy target, no cross-origin API-URL config to
+maintain) since there's no operational reason to split them at this scale.
 
 ## Corpus
 
@@ -148,18 +179,26 @@ used the first time.
 ```bash
 pip install -r requirements.txt
 python src/prepare_source_corpus.py   # one-time: fetch->PDF (already done; corpus is checked in)
+
+# local index files, for fast dev-loop testing (no network/Supabase needed)
 python src/build_index.py             # ingest -> chunk -> embed -> local index/ files
 python src/ask.py "Is a screening colonoscopy covered for a 55 year old at average risk?"
 python eval/run_eval.py               # run the 3 fixed eval cases (against the local index)
-python eval/run_eval.py --remote https://claimsrag-chat.fly.dev  # same cases, against the live deployment
 python scripts/calibrate_threshold.py # re-check REFUSAL_THRESHOLD; re-run after any corpus change
+
+# Supabase -- the actual vector store the deployed API queries
+python src/pdf_vector_indexer.py --pdf-dir data/source_pdfs \
+  --supabase-url https://mtfyctrxmbbwxwohtdhr.supabase.co --supabase-key "$SUPABASE_SERVICE_ROLE_KEY"
+python src/supabase_ask.py "Is a screening colonoscopy covered for a 55 year old at average risk?"
+python eval/run_eval.py --remote https://claimsrag-chat.fly.dev  # same 3 cases, against the live deployment
 ```
 
 ## Supabase (pgvector) storage
 
-The same 57 embedded chunks also live in Supabase Postgres, project
-**cms-coverage-rag** (`mtfyctrxmbbwxwohtdhr`, free tier, region us-west-1) —
-a separate project from the SARO database, created for this exercise.
+Supabase Postgres is the **canonical vector store** — project
+**cms-coverage-rag** (`mtfyctrxmbbwxwohtdhr`, free tier, region us-west-1),
+separate from the SARO database. The deployed API queries it live (see
+below); it's not a mirror of a local index anymore.
 
 ```sql
 create extension vector;
@@ -191,26 +230,52 @@ create policy "Public read access" on ncd_chunks for select using (true);
 ```
 
 Row-level security only grants `SELECT` — the anon key can query but not
-write, so it's safe to embed client-side (it's in `src/supabase_ask.py`).
-`src/supabase_ask.py` embeds the question locally, calls `match_ncd_chunks`
-over the PostgREST RPC endpoint, and runs the identical `compose_answer()`
-extractive/refusal logic as the local path — same code, different vector
-store:
+write, so it's safe to embed client-side (`src/supabase_client.py`, used by
+both `src/supabase_ask.py` and `api/main.py`).
 
 ```bash
 python src/supabase_ask.py "Is a screening colonoscopy covered for a 55 year old at average risk?"
 ```
 
-Verified to return the same top matches and similarity scores as the local
-`index/` files for both the answerable and refusal eval questions.
+### Writing to Supabase (`PDFVectorIndexer.save_to_supabase`)
+
+The **write** side needs a different, more privileged key — the anon
+key's RLS policy is read-only on purpose. `save_to_supabase()` takes a
+service-role key and is never called from client-facing code:
+
+```bash
+python src/pdf_vector_indexer.py --pdf-dir data/source_pdfs \
+  --supabase-url https://mtfyctrxmbbwxwohtdhr.supabase.co \
+  --supabase-key "$SUPABASE_SERVICE_ROLE_KEY"
+```
+
+Idempotent **per document**, not just per chunk: for every `doc_id` in the
+batch being indexed, it first deletes all existing rows for that `doc_id`,
+then inserts the fresh set. A plain upsert-by-`chunk_id` alone would leave
+orphaned rows behind if a revised PDF produces fewer chunks than its
+previous version did (`chunk_id`s are `{doc_id}-{i}`, so a shrinking
+document's higher-numbered chunks would otherwise never get cleaned up).
+
+### Automated indexing (`.github/workflows/index-corpus.yml`)
+
+Triggers on `data/source_pdfs/**` changes (or manual `workflow_dispatch`),
+independent of the app-deploy workflow — see "Architecture" above. Needs a
+`SUPABASE_SERVICE_ROLE_KEY` repository secret, added manually via the
+GitHub UI (Settings → Secrets and variables → Actions) rather than by me —
+service-role keys shouldn't pass through an agent conversation. Find the
+value in the Supabase dashboard under Project Settings → API →
+`service_role` secret key.
 
 ## Chat UI + Fly.io deployment
 
-`api/main.py` is a FastAPI service that loads the local index (baked into
-the Docker image, not Supabase — self-contained, no external call on the
-request path) once at startup and exposes:
+`api/main.py` is a FastAPI service (Module 2 + 3 from the architecture
+diagram above). At startup it loads only the embedding model — no local
+index is baked into the Docker image. Each request embeds the question
+locally, then queries Supabase live via `supabase_client.supabase_retrieve()`,
+so a document indexed by the CI workflow above shows up here without a
+redeploy. Exposes:
 
-- `GET /health` — readiness + chunk count
+- `GET /health` — readiness + live chunk count from Supabase + which backend
 - `POST /api/ask` — `{question}` -> `{answer, refused, citations[]}`
 - `GET /` — a single-page vanilla-JS chat UI (`api/static/index.html`) that
   posts to `/api/ask` and renders the answer with a refused/answered badge
@@ -227,7 +292,8 @@ The Dockerfile installs the CPU-only torch wheel explicitly (sentence-
 transformers otherwise pulls the full CUDA build, bloating the image by
 ~2GB for no benefit on a CPU-only Fly machine) and bakes the MiniLM weights
 in at build time so a cold-started machine doesn't hit the Hugging Face Hub
-on the first request.
+on the first request. Torch is still needed here even though there's no
+local index anymore -- the API embeds each incoming question itself.
 
 `eval/run_eval.py --remote <url>` runs the same 3 eval cases against a
 deployed `/api/ask` endpoint instead of the local index — same
@@ -261,3 +327,16 @@ Latest run: **3/3 passed** (`python eval/run_eval.py`).
   non-ASCII characters (curly quotes, section signs, trademark symbols) are
   transliterated during corpus prep — a real fpdf2/pypdf encoding quirk
   found and worked around while building this.
+- The deployed API now depends on Supabase being reachable for every
+  request (it queries live, no local fallback index). That's the explicit
+  tradeoff for "new documents show up without a redeploy" — a self-contained
+  baked-in-index deploy has no such dependency but also can't pick up new
+  documents without shipping a new image. `src/build_index.py` /
+  `src/ask.py` still work fully offline against local files if that
+  tradeoff ever needs revisiting.
+- `save_to_supabase()`'s idempotency is per-document (delete all rows for a
+  `doc_id`, then reinsert), not transactional across documents — a job that
+  dies partway through indexing multiple PDFs can leave some documents
+  updated and others not. Fine for this corpus's size (a few documents,
+  seconds to reindex); would want a single transaction or a staging-table
+  swap for a much larger one.
