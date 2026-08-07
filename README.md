@@ -5,6 +5,8 @@ Determinations (NCDs), answering coverage questions with a citation to the
 exact source chunk, and refusing when the ingested documents don't address
 the question.
 
+**Live chat UI: https://claimsrag-chat.fly.dev**
+
 ## Corpus
 
 Sourced live from the CMS Coverage Medicare Coverage Database (via MCP) and
@@ -121,6 +123,34 @@ python src/supabase_ask.py "Is a screening colonoscopy covered for a 55 year old
 
 Verified to return the same top matches and similarity scores as the local
 `index/` files for both the answerable and refusal eval questions.
+
+## Chat UI + Fly.io deployment
+
+`api/main.py` is a FastAPI service that loads the local index (baked into
+the Docker image, not Supabase — self-contained, no external call on the
+request path) once at startup and exposes:
+
+- `GET /health` — readiness + chunk count
+- `POST /api/ask` — `{question}` -> `{answer, refused, citations[]}`
+- `GET /` — a single-page vanilla-JS chat UI (`api/static/index.html`) that
+  posts to `/api/ask` and renders the answer with a refused/answered badge
+  and the ranked citation list with similarity scores
+
+Deployed on Fly.io as app **claimsrag-chat** (region `iad`, shared-cpu-1x,
+1GB RAM, scale-to-zero when idle):
+
+```bash
+flyctl deploy --remote-only
+```
+
+The Dockerfile installs the CPU-only torch wheel explicitly (sentence-
+transformers otherwise pulls the full CUDA build, bloating the image by
+~2GB for no benefit on a CPU-only Fly machine) and bakes the MiniLM weights
+in at build time so a cold-started machine doesn't hit the Hugging Face Hub
+on the first request.
+
+All 3 eval questions (answerable / refusal / adversarial) were re-run
+directly against the live URL and matched local results exactly.
 
 ## Eval cases (`eval/cases.json`)
 
