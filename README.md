@@ -1,29 +1,55 @@
 # CMS Coverage RAG — "Can this claim's procedure be covered?"
 
-A small, fully-local RAG pipeline over 4 real CMS National Coverage
-Determinations (NCDs), answering coverage questions with a citation to the
-exact source chunk, and refusing when the ingested documents don't address
-the question.
+A small, fully-local RAG pipeline over 5 real CMS/federal coverage documents,
+answering coverage questions with a citation to the exact source chunk, and
+refusing when the ingested documents don't address the question.
 
 **Live chat UI: https://claimsrag-chat.fly.dev**
 
 ## Corpus
 
-Sourced live from the CMS Coverage Medicare Coverage Database (via MCP) and
-rendered as individual PDFs in `data/source_pdfs/`:
+Sourced live from the CMS Coverage Medicare Coverage Database (via MCP) plus
+one federal regulation (via GovInfo.gov), rendered as individual PDFs in
+`data/source_pdfs/`:
 
-| NCD | Title |
-|---|---|
-| 210.3 | Colorectal Cancer Screening Tests |
-| 220.6.17 | Positron Emission Tomography (FDG) for Oncologic Conditions |
-| 240.4 | Continuous Positive Airway Pressure (CPAP) Therapy for Obstructive Sleep Apnea |
-| 20.10.1 | Cardiac Rehabilitation Programs for Chronic Heart Failure |
+| Doc | Display ID | Title |
+|---|---|---|
+| NCD | 210.3 | Colorectal Cancer Screening Tests |
+| NCD | 220.6.17 | Positron Emission Tomography (FDG) for Oncologic Conditions |
+| NCD | 240.4 | Continuous Positive Airway Pressure (CPAP) Therapy for Obstructive Sleep Apnea |
+| NCD | 20.10.1 | Cardiac Rehabilitation Programs for Chronic Heart Failure |
+| CFR | 410.37 | Colorectal Cancer Screening Tests: Conditions for and Limitations on Coverage |
 
 `src/prepare_source_corpus.py` is the one-time script that built these PDFs
 from the raw API responses (saved in `data/raw_html/`). It is **not** part of
 the reusable pipeline — the pipeline itself starts from whatever PDFs are
-sitting in `data/source_pdfs/`, so dropping in different NCD/LCD PDFs and
+sitting in `data/source_pdfs/`, so dropping in different NCD/LCD/CFR PDFs and
 re-running `build_index.py` works the same way.
+
+### A false-positive found via real usage, and how it was fixed
+
+The original corpus had only the 4 NCDs. Asking it "is a screening
+colonoscopy covered?" got an *answer* (0.64 similarity, above the refusal
+threshold) — but the cited text was just NCD 210.3's document-title preamble,
+not actual coverage criteria. Investigation showed NCD 210.3's own
+`indications_limitations` text (as returned by the CMS Coverage MCP) only
+covers FOBT, Cologuard, and blood-based biomarker tests — it never restates
+screening-colonoscopy criteria at all. The retriever wasn't broken: it
+correctly found the closest available match in a corpus that simply didn't
+contain the answer, and that topical closeness was enough to clear the
+refusal gate. A **false positive past the refusal gate** — topically
+plausible, substantively empty.
+
+The actual screening-colonoscopy frequency/eligibility rules (119 months for
+average-risk beneficiaries, 23 months for high-risk) are defined directly in
+the regulation, 42 CFR 410.37, not restated in the NCD narrative. That
+regulation was fetched verbatim from GovInfo.gov (raw XML saved at
+`data/raw_html/cfr_410_37.xml`) and added as a 5th source document, chunked
+by its own lettered paragraphs ((a) through (k)) so `(g) Limitations on
+coverage of screening colonoscopies` becomes its own precisely-matching
+chunk. Re-running the same question now cites that chunk directly (0.68
+similarity) with the actual "119 months" / "23 months" language, instead of
+a document title.
 
 ## Pipeline
 
@@ -51,7 +77,7 @@ data/source_pdfs/*.pdf
 
 The pipeline never asks a model to freely compose the answer. It selects the
 best-matching chunk and returns it **verbatim** with a citation
-(`[NCD <id> "<title>", <section>, p.<page>]`). No API key, no hallucination
+(`[<NCD|CFR> <id> "<title>", <section>, p.<page>]`). No API key, no hallucination
 risk, and the "answer must cite the source chunk" requirement is structurally
 guaranteed rather than something a generation step has to be trusted to do.
 The tradeoff: the system won't synthesize across multiple chunks or spell out
@@ -63,8 +89,13 @@ a deliberate, conservative choice for a coverage-determination context.
 
 Calibrated empirically (see eval run below): on-topic queries against this
 corpus scored 0.58-0.68 top-1 cosine similarity; a clearly out-of-corpus
-query (total knee replacement — not addressed by any of the 4 NCDs) topped
-out at 0.31. `REFUSAL_THRESHOLD = 0.38` sits in that gap.
+query (total knee replacement — not addressed by any of the 5 documents)
+topped out at 0.33. `REFUSAL_THRESHOLD = 0.38` sits in that gap. Note this
+is a topic-level gate, not a substance-level one: it catches "nothing in the
+corpus is even about this" but, as the colonoscopy case above showed, it
+can't by itself catch "something in the corpus is about this topic but
+doesn't actually answer the specific question" — that requires the corpus
+to genuinely contain the relevant text, not a better threshold.
 
 ## Usage
 
@@ -78,7 +109,7 @@ python eval/run_eval.py               # run the 3 fixed eval cases (against the 
 
 ## Supabase (pgvector) storage
 
-The same 41 embedded chunks also live in Supabase Postgres, project
+The same 57 embedded chunks also live in Supabase Postgres, project
 **cms-coverage-rag** (`mtfyctrxmbbwxwohtdhr`, free tier, region us-west-1) —
 a separate project from the SARO database, created for this exercise.
 
@@ -88,6 +119,7 @@ create extension vector;
 create table ncd_chunks (
   id bigserial primary key,
   chunk_id text unique not null,
+  doc_type text not null default 'NCD',  -- 'NCD' or 'CFR'
   doc_id text, display_id text, title text, section text,
   page integer, effective_date text, source_file text,
   text text not null,
@@ -98,10 +130,10 @@ create index ncd_chunks_embedding_idx on ncd_chunks
   using hnsw (embedding vector_cosine_ops);
 
 create function match_ncd_chunks(query_embedding vector(384), match_count int default 4)
-returns table (chunk_id text, doc_id text, display_id text, title text,
+returns table (chunk_id text, doc_type text, doc_id text, display_id text, title text,
                section text, page integer, text text, similarity float)
 language sql stable as $$
-  select chunk_id, doc_id, display_id, title, section, page, text,
+  select chunk_id, doc_type, doc_id, display_id, title, section, page, text,
          1 - (embedding <=> query_embedding) as similarity
   from ncd_chunks order by embedding <=> query_embedding limit match_count;
 $$;
@@ -156,8 +188,8 @@ directly against the live URL and matched local results exactly.
 
 | Case | Question | Expected | Why |
 |---|---|---|---|
-| `answerable-colonoscopy` | Screening colonoscopy, 55yo average risk | Answers, cites NCD 210.3 | Squarely in-corpus |
-| `refusal-knee-replacement` | Total knee replacement, 70yo osteoarthritis | **Refuses** | None of the 4 NCDs address joint replacement — the retriever's best match (0.31) sits well below the refusal threshold (0.38) |
+| `answerable-colonoscopy` | Screening colonoscopy, 55yo average risk | Answers, cites CFR 410.37, quotes "119 months" | See "A false-positive found via real usage" above — this case originally passed against a citation that was substantively empty (NCD 210.3's Preamble) until 42 CFR 410.37 was added to the corpus |
+| `refusal-knee-replacement` | Total knee replacement, 70yo osteoarthritis | **Refuses** | None of the 5 documents address joint replacement — the retriever's best match (0.33) sits well below the refusal threshold (0.38) |
 | `adversarial-cardiac-rehab-ef-above-threshold` | Cardiac rehab, heart failure, LVEF 40% | Answers, cites NCD 20.10.1, quotes "35%" | The retriever correctly finds the *covered-indications* chunk (topically closest), but that chunk's actual criterion is LVEF <= 35% — this patient's 40% doesn't qualify. Extractive quoting surfaces the disqualifying number instead of the system silently implying "covered." |
 
 Latest run: **3/3 passed** (`python eval/run_eval.py`).

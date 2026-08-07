@@ -43,11 +43,13 @@ REFUSAL_THRESHOLD = 0.38
 TOP_K = 4
 
 HEADER_LINE_RE = re.compile(
-    r"^NCD (?P<display_id>\S+) \(Doc ID (?P<doc_id>\d+)\) -- Effective (?P<date>\S+)$"
+    r"^(?P<doc_type>NCD|CFR) (?P<display_id>\S+) \(Doc ID (?P<doc_id>\S+)\) -- "
+    r"Effective (?P<date>\S+)$"
 )
 HEADING_RE = re.compile(
     r"^([A-Z]\.\s+[A-Z][A-Za-z /()\-]+|Item/Service Description|"
-    r"Indications and Limitations of Coverage)$"
+    r"Indications and Limitations of Coverage|"
+    r"\([a-z]\)\s+[A-Z][A-Za-z0-9 /()\-,:]+[.:])$"
 )
 
 
@@ -81,6 +83,7 @@ def parse_doc_metadata(pdf_path: Path, pages):
         raise ValueError(f"{pdf_path.name}: could not parse header line {lines[:1]!r}")
     title = lines[2].strip() if len(lines) > 2 else pdf_path.stem
     return {
+        "doc_type": m.group("doc_type"),
         "doc_id": m.group("doc_id"),
         "display_id": m.group("display_id"),
         "effective_date": m.group("date"),
@@ -167,6 +170,7 @@ def chunk_pdf(pdf_path: Path):
             page_num = page_for_offset(offsets, abs_offset)
             chunks.append(
                 {
+                    "doc_type": doc_meta["doc_type"],
                     "doc_id": doc_meta["doc_id"],
                     "display_id": doc_meta["display_id"],
                     "title": doc_meta["title"],
@@ -232,7 +236,8 @@ def retrieve(question: str, chunks, embeddings, model=None, top_k: int = TOP_K):
 
 
 def format_citation(chunk: dict) -> str:
-    return f"[NCD {chunk['display_id']} \"{chunk['title']}\", {chunk['section']}, p.{chunk['page']}]"
+    doc_type = chunk.get("doc_type", "NCD")
+    return f"[{doc_type} {chunk['display_id']} \"{chunk['title']}\", {chunk['section']}, p.{chunk['page']}]"
 
 
 def compose_answer(results, threshold: float = REFUSAL_THRESHOLD):

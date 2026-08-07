@@ -53,18 +53,10 @@ def html_to_text(fragment: str) -> str:
     text = re.sub(r"<li[^>]*>", "\n  - ", text, flags=re.I)
     text = re.sub(r"</p>|<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
-    for uni, ascii_eq in UNICODE_TO_ASCII.items():
-        text = text.replace(uni, ascii_eq)
-    # Safety net: the core Helvetica PDF font only supports latin-1. Any
-    # character we didn't explicitly transliterate above gets replaced
-    # rather than crashing PDF generation.
-    # Plain ASCII only: fpdf2's core Helvetica font round-trips some latin-1
-    # glyphs (e.g. section-sign) incorrectly through pypdf extraction later,
-    # so don't rely on "in latin-1" as good enough -- go all the way to ASCII.
-    text = text.encode("ascii", errors="replace").decode("ascii")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    # Sanitize down to ASCII here (not just latin-1): fpdf2's core Helvetica
+    # font round-trips some latin-1 glyphs (e.g. section-sign) incorrectly
+    # through pypdf extraction later, so "in latin-1" isn't good enough.
+    return sanitize_ascii(text)
 
 
 def load_batch_docs() -> dict:
@@ -101,31 +93,31 @@ def mc(pdf, w, h, text):
     pdf.multi_cell(w, h, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
-def build_pdf(doc: dict, out_path: Path) -> None:
-    doc_id = doc["document_id"]
-    display_id = doc.get("document_display_id", doc_id)
-    title = doc["title"]
-    effective_date = doc.get("effective_date", "N/A")
+def sanitize_ascii(text: str) -> str:
+    for uni, ascii_eq in UNICODE_TO_ASCII.items():
+        text = text.replace(uni, ascii_eq)
+    text = text.encode("ascii", errors="replace").decode("ascii")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
+
+def build_pdf_from_sections(doc_type: str, doc_label: str, doc_id: str, display_id: str,
+                             title: str, effective_date: str, sections: list, out_path: Path) -> None:
+    """Shared PDF builder: a running header, a title block, then (heading, body) sections."""
     pdf = NCDPdf(format="Letter")
-    pdf.header_txt = f"NCD {display_id} (Doc ID {doc_id}) -- Effective {effective_date}"
+    pdf.header_txt = f"{doc_type} {display_id} (Doc ID {doc_id}) -- Effective {effective_date}"
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.set_margins(20, 18, 20)
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 15)
-    mc(pdf, 0, 8, f"National Coverage Determination (NCD) {display_id}")
+    mc(pdf, 0, 8, f"{doc_label} {display_id}")
     pdf.set_font("Helvetica", "B", 13)
     mc(pdf, 0, 7, title)
     pdf.ln(4)
 
-    sections = [
-        ("Item/Service Description", doc.get("item_service_description", "")),
-        ("Indications and Limitations of Coverage", doc.get("indications_limitations", "")),
-    ]
-
-    for heading, raw in sections:
-        text = html_to_text(raw)
+    for heading, text in sections:
         if not text:
             continue
         pdf.set_font("Helvetica", "B", 12)
@@ -136,6 +128,145 @@ def build_pdf(doc: dict, out_path: Path) -> None:
         pdf.ln(4)
 
     pdf.output(str(out_path))
+
+
+def build_pdf(doc: dict, out_path: Path) -> None:
+    doc_id = doc["document_id"]
+    display_id = doc.get("document_display_id", doc_id)
+    sections = [
+        ("Item/Service Description", html_to_text(doc.get("item_service_description", ""))),
+        ("Indications and Limitations of Coverage", html_to_text(doc.get("indications_limitations", ""))),
+    ]
+    build_pdf_from_sections(
+        "NCD", "National Coverage Determination (NCD)", doc_id, display_id,
+        doc["title"], doc.get("effective_date", "N/A"), sections, out_path,
+    )
+
+
+# Verbatim transcription of 42 CFR 410.37 (Colorectal cancer screening tests:
+# Conditions for and limitations on coverage), as of the 2023-10-01 revision.
+# Source: raw XML fetched from GovInfo.gov, saved at data/raw_html/cfr_410_37.xml
+# (govinfo.gov/content/pkg/CFR-2023-title42-vol2/xml/CFR-2023-title42-vol2-sec410-37.xml).
+# Added because the CMS Coverage MCP's NCD 210.3 text (FOBT/Cologuard/blood-based
+# biomarker sections only) does not itself restate screening-colonoscopy coverage
+# criteria -- those live directly in this regulation instead.
+CFR_410_37_SECTIONS = [
+    ("(a) Definitions.",
+     "As used in this section, the following definitions apply:\n\n"
+     "(1) Colorectal cancer screening tests means any of the following procedures furnished to an "
+     "individual for the purpose of early detection of colorectal cancer:\n"
+     "(i) Screening fecal-occult blood tests.\n"
+     "(ii) Screening flexible sigmoidoscopies.\n"
+     "(iii) Screening colonoscopies, including anesthesia furnished in conjunction with the service.\n"
+     "(iv) Screening barium enemas.\n"
+     "(v) Other tests or procedures established by a national coverage determination, and modifications "
+     "to tests under this paragraph, with such frequency and payment limits as CMS determines appropriate, "
+     "in consultation with appropriate organizations\n\n"
+     "(2) Screening fecal-occult blood test means -\n"
+     "(i) A guaiac-based test for peroxidase activity, testing two samples from each of three consecutive "
+     "stools, or,\n"
+     "(ii) Other tests as determined by the Secretary through a national coverage determination.\n\n"
+     "(3) An individual at high risk for colorectal cancer means an individual with -\n"
+     "(i) A close relative (sibling, parent, or child) who has had colorectal cancer or an adenomatous polyp;\n"
+     "(ii) A family history of familial adenomatous polyposis;\n"
+     "(iii) A family history of hereditary nonpolyposis colorectal cancer;\n"
+     "(iv) A personal history of adenomatous polyps; or\n"
+     "(v) A personal history of colorectal cancer; or\n"
+     "(vi) Inflammatory bowel disease, including Crohn's Disease, and ulcerative colitis.\n\n"
+     "(4) Screening barium enema means -\n"
+     "(i) A screening double contrast barium enema of the entire colorectum (including a physician's "
+     "interpretation of the results of the procedure); or\n"
+     "(ii) In the case of an individual whose attending physician decides that he or she cannot tolerate a "
+     "screening double contrast barium enema, a screening single contrast barium enema of the entire "
+     "colorectum (including a physician's interpretation of the results of the procedure).\n\n"
+     "(5) An attending physician for purposes of this provision is a doctor of medicine or osteopathy (as "
+     "defined in section 1861(r)(1) of the Act) who is fully knowledgeable about the beneficiary's medical "
+     "condition, and who would be responsible using the results of any examination performed in the overall "
+     "management of the beneficiary's specific medical problem."),
+
+    ("(b) Condition for coverage of screening fecal-occult blood tests.",
+     "Medicare Part B pays for a screening fecal-occult blood test if it is ordered in writing by the "
+     "beneficiary's attending physician, physician assistant, nurse practitioner, or clinical nurse specialist."),
+
+    ("(c) Limitations on coverage of screening fecal-occult blood tests.",
+     "(1) Payment may not be made for a screening fecal-occult blood test performed for an individual "
+     "under age 45.\n"
+     "(2) For an individual 45 years of age or over, payment may be made for a screening fecal-occult "
+     "blood test performed after at least 11 months have passed following the month in which the last "
+     "screening fecal-occult blood test was performed."),
+
+    ("(d) Condition for coverage of flexible sigmoidoscopy screening.",
+     "Medicare Part B pays for a flexible sigmoidoscopy screening service if it is performed by a doctor "
+     "of medicine or osteopathy (as defined in section 1861(r)(1) of the Act), or by a physician assistant, "
+     "nurse practitioner, or clinical nurse specialist (as defined in section 1861(aa)(5) of the Act and "
+     "Sec. 410.74, 410.75, and 410.76) who is authorized under State law to perform the examination."),
+
+    ("(e) Limitations on coverage of screening flexible sigmoidoscopies.",
+     "(1) Payment may not be made for a screening flexible sigmoidoscopy performed for an individual "
+     "under age 45.\n"
+     "(2) For an individual 45 years of age or over, except as described in paragraph (e)(3) of this "
+     "section, payment may be made for screening flexible sigmoidoscopy after at least 47 months have "
+     "passed following the month in which the last screening flexible sigmoidoscopy or, as provided in "
+     "paragraphs (h) and (i) of this section, the last screening barium enema was performed.\n"
+     "(3) In the case of an individual who is not at high risk for colorectal cancer as described in "
+     "paragraph (a)(3) of this section but who has had a screening colonoscopy performed, payment may be "
+     "made for a screening flexible sigmoidoscopy only after at least 119 months have passed following the "
+     "month in which the last screening colonoscopy was performed."),
+
+    ("(f) Condition for coverage of screening colonoscopies.",
+     "Medicare Part B pays for a screening colonoscopy if it is performed by a doctor of medicine or "
+     "osteopathy (as defined in section 1861(r)(1) of the Act)."),
+
+    ("(g) Limitations on coverage of screening colonoscopies.",
+     "(1) Effective for services furnished on or after July 1, 2001, except as described in paragraph (g)(3) "
+     "of this section, payment may be made for a screening colonoscopy performed for an individual who is "
+     "not at high risk for colorectal cancer as described in paragraph (a)(3) of this section, after at "
+     "least 119 months have passed following the month in which the last screening colonoscopy was "
+     "performed.\n"
+     "(2) Payment may be made for a screening colonoscopy performed for an individual who is at high risk "
+     "for colorectal cancer as described in paragraph (a)(3) of this section, after at least 23 months have "
+     "passed following the month in which the last screening colonoscopy was performed, or, as provided in "
+     "paragraphs (h) and (i) of this section, the last screening barium enema was performed.\n"
+     "(3) In the case of an individual who is not at high risk for colorectal cancer as described in "
+     "paragraph (a)(3) of this section but who has had a screening flexible sigmoidoscopy performed, "
+     "payment may be made for a screening colonoscopy only after at least 47 months have passed following "
+     "the month in which the last screening flexible sigmoidoscopy was performed."),
+
+    ("(h) Conditions for coverage of screening barium enemas.",
+     "Medicare Part B pays for a screening barium enema if it is ordered in writing by the beneficiary's "
+     "attending physician."),
+
+    ("(i) Limitations on coverage of screening barium enemas.",
+     "(1) In the case of an individual age 45 or over who is not at high risk of colorectal cancer, payment "
+     "may be made for a screening barium enema examination performed after at least 47 months have passed "
+     "following the month in which the last screening barium enema or screening flexible sigmoidoscopy was "
+     "performed.\n"
+     "(2) In the case of an individual who is at high risk for colorectal cancer, payment may be made for a "
+     "screening barium enema examination performed after at least 23 months have passed following the month "
+     "in which the last screening barium enema or the last screening colonoscopy was performed."),
+
+    ("(j) Expansion of coverage of colorectal cancer screening tests.",
+     "Effective January 1, 2022, colorectal cancer screening tests include a planned screening flexible "
+     "sigmoidoscopy or screening colonoscopy that involves the removal of tissue or other matter or other "
+     "procedure furnished in connection with, as a result of, and in the same clinical encounter as the "
+     "screening test."),
+
+    ("(k) A complete colorectal cancer screening.",
+     "Effective January 1, 2023, colorectal cancer screening tests include a follow-on screening "
+     "colonoscopy after a Medicare covered non-invasive stool-based colorectal cancer screening test "
+     "returns a positive result. The frequency limitations described for screening colonoscopy in "
+     "paragraph (g) of this section shall not apply in the instance of a follow-on screening colonoscopy "
+     "test described in this paragraph."),
+]
+
+
+def build_cfr_pdf(out_path: Path) -> None:
+    sections = [(h, sanitize_ascii(b)) for h, b in CFR_410_37_SECTIONS]
+    build_pdf_from_sections(
+        "CFR", "42 CFR", "410.37", "410.37",
+        "Colorectal Cancer Screening Tests: Conditions for and Limitations on Coverage",
+        "10/01/2023", sections, out_path,
+    )
 
 
 def main():
@@ -153,6 +284,10 @@ def main():
         out_path = SOURCE_PDF_DIR / f"NCD_{display_id}_{doc_id}.pdf"
         build_pdf(doc, out_path)
         print(f"wrote {out_path.name}")
+
+    cfr_out_path = SOURCE_PDF_DIR / "CFR_410_37.pdf"
+    build_cfr_pdf(cfr_out_path)
+    print(f"wrote {cfr_out_path.name}")
 
 
 if __name__ == "__main__":

@@ -4,8 +4,9 @@
     "question": "Is a screening colonoscopy covered for a 55 year old at average risk for colorectal cancer?",
     "type": "answerable",
     "expect_refusal": false,
-    "must_cite_display_id": "210.3",
-    "must_contain_any": ["colonoscopy", "colorectal"]
+    "must_cite_display_id": "410.37",
+    "must_contain_any": ["119 months"],
+    "note": "NCD 210.3's own text only covers FOBT/Cologuard/blood-based biomarker tests -- it never restates screening-colonoscopy criteria. Those live in 42 CFR 410.37(g), added to the corpus after the system initially answered this question by citing only NCD 210.3's Preamble (a topically-close but substantively empty match). Success = the top citation is the actual regulation, quoting the real frequency limit (119 months average risk / 23 months high risk), not a document title."
   },
   {
     "id": "refusal-knee-replacement",
