@@ -16,3 +16,14 @@ jobs:
       - run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      # Post-deploy smoke test: same 3 eval cases run against the local
+      # index (see run_eval.py, no --remote flag) now run against the
+      # just-deployed /api/ask. Fails the workflow -- not just prints a
+      # warning -- if the live service regresses on a case that passes
+      # locally. Only needs numpy + requests: --remote mode never touches
+      # sentence-transformers/torch, since embedding happens server-side.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy requests
+      - run: python eval/run_eval.py --remote https://claimsrag-chat.fly.dev

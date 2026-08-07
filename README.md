@@ -200,7 +200,12 @@ on the first request.
 deployed `/api/ask` endpoint instead of the local index — same
 `check_case()` logic, different backend — so "does the live deployment
 still behave like the local index" is an automated check rather than a
-manually re-typed curl command.
+manually re-typed curl command. It's wired into
+`.github/workflows/fly-deploy.yml` as a post-deploy step (installs only
+`numpy` + `requests` — `--remote` mode never touches
+sentence-transformers/torch, since embedding happens server-side): the
+workflow fails, not just deploys, if the live service regresses on a case
+that passes locally.
 
 ## Eval cases (`eval/cases.json`)
 
