@@ -35,11 +35,16 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_WORDS = 160
 CHUNK_OVERLAP_WORDS = 40
 
-# Calibrated empirically in scripts/calibrate_threshold.py against on-topic
-# vs. off-topic probe queries: on-topic top-1 cosine similarity clustered
-# ~0.45-0.75, off-topic (procedures absent from the corpus) clustered
-# ~0.15-0.35. 0.38 sits in the gap.
-REFUSAL_THRESHOLD = 0.38
+# Calibrated empirically via scripts/calibrate_threshold.py against 5
+# on-topic and 3 off-topic probe queries on the current 5-document corpus:
+# on-topic top-1 cosine similarity clustered 0.668-0.757, off-topic
+# (procedures absent from the corpus) clustered 0.332-0.519. 0.6 sits in
+# that gap. Re-run the calibration script whenever the corpus changes --
+# adding 42 CFR 410.37 shifted the off-topic ceiling up from ~0.31 to
+# ~0.52 (its general Medicare-payment boilerplate language has broader
+# semantic surface area than the NCD-only corpus did), which pushed the
+# old 0.38 threshold to sit inside the off-topic range instead of the gap.
+REFUSAL_THRESHOLD = 0.6
 TOP_K = 4
 
 HEADER_LINE_RE = re.compile(
@@ -244,6 +249,12 @@ def compose_answer(results, threshold: float = REFUSAL_THRESHOLD):
     """Shared extractive-answer + refusal-gate logic. `results` is a list of
     (chunk_dict, similarity_score) tuples, best match first -- works the same
     whether they came from the local numpy index or the Supabase RPC."""
+    if not results:
+        return {
+            "refused": True,
+            "answer": "No indexed chunks were retrieved -- the index may be empty.",
+            "results": results,
+        }
     best_chunk, best_score = results[0]
 
     if best_score < threshold:

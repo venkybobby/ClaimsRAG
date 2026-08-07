@@ -131,7 +131,7 @@ function addMsg(role, html) {
 function renderCitations(citations) {
   if (!citations || !citations.length) return '';
   const rows = citations.map(c =>
-    `<div class="citation"><b>${c.similarity.toFixed(3)}</b> &nbsp;NCD ${c.display_id} "${c.title}" &mdash; ${c.section}, p.${c.page}</div>`
+    `<div class="citation"><b>${c.similarity.toFixed(3)}</b> &nbsp;${escapeHtml(c.doc_type)} ${escapeHtml(c.display_id)} "${escapeHtml(c.title)}" &mdash; ${escapeHtml(c.section)}, p.${c.page}</div>`
   ).join('');
   return `<div class="citations">${rows}</div>`;
 }

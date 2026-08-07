@@ -7,6 +7,7 @@ API key, self-contained.
 """
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -20,7 +21,20 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from rag_lib import answer, get_embedder, load_index, REFUSAL_THRESHOLD  # noqa: E402
 
-app = FastAPI(title="CMS Coverage RAG")
+_state = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    t0 = time.time()
+    _state["chunks"], _state["embeddings"] = load_index()
+    _state["model"] = get_embedder()
+    _state["ready_secs"] = round(time.time() - t0, 1)
+    print(f"Loaded {len(_state['chunks'])} chunks + embedder in {_state['ready_secs']}s")
+    yield
+
+
+app = FastAPI(title="CMS Coverage RAG", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,23 +42,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_state = {}
-
-
-@app.on_event("startup")
-def load_model_and_index():
-    t0 = time.time()
-    _state["chunks"], _state["embeddings"] = load_index()
-    _state["model"] = get_embedder()
-    _state["ready_secs"] = round(time.time() - t0, 1)
-    print(f"Loaded {len(_state['chunks'])} chunks + embedder in {_state['ready_secs']}s")
-
 
 class AskRequest(BaseModel):
     question: str
 
 
 class Citation(BaseModel):
+    doc_type: str
     display_id: str
     title: str
     section: str
@@ -77,6 +81,7 @@ def ask(req: AskRequest):
     result = answer(question, _state["chunks"], _state["embeddings"], model=_state["model"])
     citations = [
         Citation(
+            doc_type=chunk.get("doc_type", "NCD"),
             display_id=chunk["display_id"],
             title=chunk["title"],
             section=chunk["section"],

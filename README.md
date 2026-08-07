@@ -69,7 +69,7 @@ data/source_pdfs/*.pdf
   cosine-similarity top-k retrieval (rag_lib.retrieve)
       v
   extractive answer (rag_lib.answer):
-      - below REFUSAL_THRESHOLD (0.38) -> refuse
+      - below REFUSAL_THRESHOLD (0.6) -> refuse
       - otherwise -> quote the top chunk verbatim + citation
 ```
 
@@ -87,15 +87,28 @@ a deliberate, conservative choice for a coverage-determination context.
 
 ### Refusal threshold
 
-Calibrated empirically (see eval run below): on-topic queries against this
-corpus scored 0.58-0.68 top-1 cosine similarity; a clearly out-of-corpus
-query (total knee replacement — not addressed by any of the 5 documents)
-topped out at 0.33. `REFUSAL_THRESHOLD = 0.38` sits in that gap. Note this
-is a topic-level gate, not a substance-level one: it catches "nothing in the
+Calibrated empirically via `scripts/calibrate_threshold.py` (5 on-topic
+probes, one or more per document, vs. 3 clearly off-topic ones): on-topic
+top-1 cosine similarity clustered 0.668-0.757; off-topic topped out at
+0.519. `REFUSAL_THRESHOLD = 0.6` sits in that gap. Note this is a
+topic-level gate, not a substance-level one: it catches "nothing in the
 corpus is even about this" but, as the colonoscopy case above showed, it
 can't by itself catch "something in the corpus is about this topic but
 doesn't actually answer the specific question" — that requires the corpus
 to genuinely contain the relevant text, not a better threshold.
+
+**The threshold moved from an earlier value of 0.38.** Adding 42 CFR
+410.37 to the corpus (see above) silently regressed the off-topic ceiling
+from ~0.31 up to ~0.52 — the regulation's generic Medicare-payment
+boilerplate ("payment may be made for...", "effective for services
+furnished on...") has broader semantic surface area than the NCD-only
+corpus did, so off-topic questions like "does Medicare cover acupuncture"
+or "is bariatric surgery covered" started scoring high enough to clear the
+old 0.38 gate and get answered instead of refused. Re-running the
+calibration script after that corpus change caught it. **The lesson: any
+corpus change needs a re-calibration pass, not just a re-index** — this
+repo now has a script for that instead of the informal one-off probing
+used the first time.
 
 ## Usage
 
@@ -105,6 +118,8 @@ python src/prepare_source_corpus.py   # one-time: fetch->PDF (already done; corp
 python src/build_index.py             # ingest -> chunk -> embed -> local index/ files
 python src/ask.py "Is a screening colonoscopy covered for a 55 year old at average risk?"
 python eval/run_eval.py               # run the 3 fixed eval cases (against the local index)
+python eval/run_eval.py --remote https://claimsrag-chat.fly.dev  # same cases, against the live deployment
+python scripts/calibrate_threshold.py # re-check REFUSAL_THRESHOLD; re-run after any corpus change
 ```
 
 ## Supabase (pgvector) storage
@@ -181,15 +196,18 @@ transformers otherwise pulls the full CUDA build, bloating the image by
 in at build time so a cold-started machine doesn't hit the Hugging Face Hub
 on the first request.
 
-All 3 eval questions (answerable / refusal / adversarial) were re-run
-directly against the live URL and matched local results exactly.
+`eval/run_eval.py --remote <url>` runs the same 3 eval cases against a
+deployed `/api/ask` endpoint instead of the local index — same
+`check_case()` logic, different backend — so "does the live deployment
+still behave like the local index" is an automated check rather than a
+manually re-typed curl command.
 
 ## Eval cases (`eval/cases.json`)
 
 | Case | Question | Expected | Why |
 |---|---|---|---|
 | `answerable-colonoscopy` | Screening colonoscopy, 55yo average risk | Answers, cites CFR 410.37, quotes "119 months" | See "A false-positive found via real usage" above — this case originally passed against a citation that was substantively empty (NCD 210.3's Preamble) until 42 CFR 410.37 was added to the corpus |
-| `refusal-knee-replacement` | Total knee replacement, 70yo osteoarthritis | **Refuses** | None of the 5 documents address joint replacement — the retriever's best match (0.33) sits well below the refusal threshold (0.38) |
+| `refusal-knee-replacement` | Total knee replacement, 70yo osteoarthritis | **Refuses** | None of the 5 documents address joint replacement — the retriever's best match (0.33) sits well below the refusal threshold (0.6) |
 | `adversarial-cardiac-rehab-ef-above-threshold` | Cardiac rehab, heart failure, LVEF 40% | Answers, cites NCD 20.10.1, quotes "35%" | The retriever correctly finds the *covered-indications* chunk (topically closest), but that chunk's actual criterion is LVEF <= 35% — this patient's 40% doesn't qualify. Extractive quoting surfaces the disqualifying number instead of the system silently implying "covered." |
 
 Latest run: **3/3 passed** (`python eval/run_eval.py`).

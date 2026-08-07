@@ -1,11 +1,19 @@
 """Run the fixed eval cases against the RAG pipeline and check expectations.
 
-Usage: python eval/run_eval.py
-Exit code 0 if every case passes, 1 otherwise.
+Usage:
+  python eval/run_eval.py                                   # local index
+  python eval/run_eval.py --remote https://claimsrag-chat.fly.dev  # deployed API
+
+Exit code 0 if every case passes, 1 otherwise. Same check_case() logic runs
+against either backend, so "does the live deployment behave the same as the
+local index" is a real automated check, not a manually re-typed curl command.
 """
+import argparse
 import json
 import sys
 from pathlib import Path
+
+import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -13,6 +21,17 @@ sys.path.insert(0, str(ROOT / "src"))
 from rag_lib import answer, get_embedder, load_index  # noqa: E402
 
 CASES_PATH = Path(__file__).resolve().parent / "cases.json"
+
+
+def remote_answer(base_url: str, question: str) -> dict:
+    """Call the deployed /api/ask endpoint and reshape its response into the
+    same {refused, answer, results: [(chunk_dict, score), ...]} shape that
+    the local rag_lib.answer() returns, so check_case() works unmodified."""
+    resp = requests.post(f"{base_url}/api/ask", json={"question": question}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    results = [(c, c["similarity"]) for c in data["citations"]]
+    return {"refused": data["refused"], "answer": data["answer"], "results": results}
 
 
 def check_case(case: dict, result: dict) -> list:
@@ -31,7 +50,7 @@ def check_case(case: dict, result: dict) -> list:
             cited = [c["display_id"] for c, _ in result["results"][:1]]
             if case["must_cite_display_id"] not in cited:
                 failures.append(
-                    f"expected top citation NCD {case['must_cite_display_id']}, "
+                    f"expected top citation display_id={case['must_cite_display_id']!r}, "
                     f"got {cited}"
                 )
         if "must_contain_any" in case:
@@ -49,13 +68,29 @@ def check_case(case: dict, result: dict) -> list:
 
 
 def main():
-    chunks, embeddings = load_index()
-    model = get_embedder()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--remote",
+        metavar="BASE_URL",
+        help="Run against a deployed /api/ask endpoint instead of the local index, "
+        "e.g. --remote https://claimsrag-chat.fly.dev",
+    )
+    args = parser.parse_args()
+
     cases = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+
+    if args.remote:
+        base_url = args.remote.rstrip("/")
+        run_one = lambda q: remote_answer(base_url, q)  # noqa: E731
+        print(f"Running against remote: {base_url}\n")
+    else:
+        chunks, embeddings = load_index()
+        model = get_embedder()
+        run_one = lambda q: answer(q, chunks, embeddings, model=model)  # noqa: E731
 
     n_pass = 0
     for case in cases:
-        result = answer(case["question"], chunks, embeddings, model=model)
+        result = run_one(case["question"])
         failures = check_case(case, result)
 
         status = "PASS" if not failures else "FAIL"
